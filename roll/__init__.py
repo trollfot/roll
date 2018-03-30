@@ -196,18 +196,18 @@ class Request(dict):
     __slots__ = (
         'app', 'url', 'path', 'query_string', '_query',
         'method', 'body', 'headers', 'route', '_cookies', '_form', '_files',
-        'upgrade'
+        'read_body'
     )
 
     def __init__(self, app):
         self.app = app
         self.headers = {}
         self.body = b''
-        self.upgrade = None
         self._cookies = None
         self._query = None
         self._form = None
         self._files = None
+        self.read_body = None
 
     @property
     def cookies(self):
@@ -388,7 +388,8 @@ class WSProtocol(WebSocketCommonProtocol):
 class HTTPProtocol(asyncio.Protocol):
     """Responsible of parsing the request and writing the response."""
 
-    __slots__ = ('app', 'request', 'parser', 'response', 'transport')
+    __slots__ = (
+        'app', 'request', 'parser', 'response', 'transport', 'body_eof')
     _BODYLESS_METHODS = ('HEAD', 'CONNECT')
     _BODYLESS_STATUSES = (HTTPStatus.CONTINUE, HTTPStatus.SWITCHING_PROTOCOLS,
                           HTTPStatus.PROCESSING, HTTPStatus.NO_CONTENT,
@@ -410,6 +411,7 @@ class HTTPProtocol(asyncio.Protocol):
             # We acted upon the upgrade earlier, so we just pass.
             pass
         except HttpParserError:
+            raise
             # If the parsing failed before on_message_begin, we don't have a
             # response.
             self.response = self.app.Response(self.app)
@@ -417,16 +419,16 @@ class HTTPProtocol(asyncio.Protocol):
             self.response.body = b'Unparsable request'
             self.write()
 
-    def upgrade(self):
+    def upgrade(self, protocol_name):
         handler_protocol = self.request.route.payload.get('protocol', 'http')
 
-        if self.request.upgrade != handler_protocol:
+        if protocol_name != handler_protocol:
             self.response.status = HTTPStatus.NOT_IMPLEMENTED
             self.response.body = 'Resource can not be upgraded.'
             self.write()
             return
 
-        upgrade_protocol = self.app.protocols.get(self.request.upgrade)
+        upgrade_protocol = self.app.protocols.get(protocol_name)
         if upgrade_protocol is None:
             # https://tools.ietf.org/html/rfc7231.html#page-63
             # the server does not support the functionality.
@@ -444,18 +446,23 @@ class HTTPProtocol(asyncio.Protocol):
         self.transport.set_protocol(new_protocol)
         return new_protocol
 
+    async def read_body(self):
+        if not self.transport.is_reading():
+            self.transport.resume_reading()
+        await self.body_eof
+
+    async def run(self):
+        await self.app(self.request, self.response)
+        self.write()
+        if self.parser.should_keep_alive():
+            await self.read_body()  # resume and drain
+        
     # All on_xxx methods are in use by httptools parser.
     # See https://github.com/MagicStack/httptools#apis
-    def on_header(self, name: bytes, value: bytes):
-        self.request.headers[name.decode().upper()] = value.decode()
-
-    def on_body(self, body: bytes):
-        # FIXME do not put all body in RAM blindly.
-        self.request.body += body
-
-    def on_headers_complete(self):
-        # Lookup the route requested
-        self.app.lookup(self.request)
+    def on_message_begin(self):
+        self.request = self.app.Request(self.app)
+        self.response = self.app.Response(self.app)
+        self.body_eof = None
 
     def on_url(self, url: bytes):
         self.request.method = self.parser.get_method().decode().upper()
@@ -464,37 +471,41 @@ class HTTPProtocol(asyncio.Protocol):
         self.request.path = unquote(parsed.path.decode())
         self.request.query_string = (parsed.query or b'').decode()
 
-    def on_message_begin(self):
-        self.request = self.app.Request(self.app)
-        self.response = self.app.Response(self.app)
+    def on_header(self, name: bytes, value: bytes):
+        self.request.headers[name.decode().upper()] = value.decode()
 
-    def on_message_complete(self):
+    def on_headers_complete(self):
+        self.app.lookup(self.request)
         if self.parser.should_upgrade():
-            # An upgrade has been requested
-            self.request.upgrade = self.request.headers['UPGRADE'].lower()
-            new_protocol = self.upgrade()
+            new_protocol = self.upgrade(
+                self.request.headers['UPGRADE'].lower())
             if new_protocol is not None:
                 # No error occured during the upgrade
                 # The protocol was found and the handler willing to comply
                 # We run the protocol task.
                 self.app.loop.create_task(new_protocol.run())
         else:
-            # No upgrade was requested
             if self.request.route.payload.get('_needs_upgrade'):
-                # The handler need and upgrade: we need to complain.
+                # The handler needs an upgrade: we need to complain.
                 self.response.status = HTTPStatus.UPGRADE_REQUIRED
                 self.write()
             else:
-                # No upgrade was required and the handler didn't need any.
-                # We run the normal task.
+                size = int(self.request.headers.get('CONTENT-LENGTH', 0))
+                if size:
+                    # The body needs to be requested explicitly in the handler
+                    self.transport.pause_reading()
+                self.body_eof = self.app.loop.create_future()
+                self.request.read_body = self.read_body
                 self.app.loop.create_task(self.run())
 
-    async def run(self):
-        await self.app(self.request, self.response)
-        self.write()
+    def on_body(self, body: bytes):
+        # FIXME do not put all body in RAM blindly.
+        self.request.body += body
 
-    # May or may not have "future" as arg.
-    def write(self, *args):
+    def on_message_complete(self):
+        self.body_eof.set_result(True)
+
+    def write(self):
         # Appends bytes for performances.
         payload = b'HTTP/1.1 %a %b\r\n' % (
             self.response.status.value, self.response.status.phrase.encode())

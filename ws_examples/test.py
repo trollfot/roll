@@ -31,6 +31,12 @@ async def hello(request, response):
     response.html('Hello World !')
 
 
+@app.route('/recv', methods=['POST'])
+async def get_files(request, response):
+    await request.read_body()  # consumes and interpret the body
+    response.html(str(request.files))
+
+
 @app.route('/chat', protocol="websocket")
 async def broadcast(request, ws, **params):
     wsid = str(uuid.uuid4())
