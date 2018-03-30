@@ -449,7 +449,7 @@ class HTTPProtocol(asyncio.Protocol):
     async def read_body(self):
         if not self.transport.is_reading():
             self.transport.resume_reading()
-        await self.body_eof
+        await self.body_eof.wait()
 
     async def run(self):
         await self.app(self.request, self.response)
@@ -494,7 +494,7 @@ class HTTPProtocol(asyncio.Protocol):
                 if size:
                     # The body needs to be requested explicitly in the handler
                     self.transport.pause_reading()
-                self.body_eof = self.app.loop.create_future()
+                self.body_eof = asyncio.Event()
                 self.request.read_body = self.read_body
                 self.app.loop.create_task(self.run())
 
@@ -503,7 +503,7 @@ class HTTPProtocol(asyncio.Protocol):
         self.request.body += body
 
     def on_message_complete(self):
-        self.body_eof.set_result(True)
+        self.body_eof.set()
 
     def write(self):
         # Appends bytes for performances.
